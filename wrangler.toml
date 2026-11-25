@@ -1,0 +1,26 @@
+name = "sub-72-assessment"
+main = "index.js"
+compatibility_date = "2026-11-25"
+
+[vars]
+SUPABASE_URL = "https://mhplukffgcxiorpfunyy.supabase.co"
+# Replace with the exact browser origin(s), comma-separated, before deployment.
+ALLOWED_ORIGINS = "REPLACE_WITH_EXACT_FRONTEND_ORIGIN"
+SUB72_FEE_CURRENCY = "USD"
+# Optional: set to 160 for the existing same-day sourcing fee. This fee is NOT charged to return GO/NO-GO.
+SUB72_LANE_B_FEE_AMOUNT = "160"
+
+# Service binding to the existing Comms Worker.
+[[services]]
+binding = "noreply-wings"
+service = "noreply-wings"
+
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+head_sampling_rate = 1.0

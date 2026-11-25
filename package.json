@@ -1,0 +1,10 @@
+{
+  "name": "15d-sub72-database-assessment",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check index.js && node --check modules/database-assessment.js && node --check modules/mission-normalizer.js && node --check modules/assessment-store.js && node --check modules/response-builder.js && node --check modules/comms-dispatch.js && node --check modules/urgency-engine.js && node --check tests/database-assessment.test.js"
+  }
+}
