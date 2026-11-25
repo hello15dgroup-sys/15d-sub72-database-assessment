@@ -9,11 +9,20 @@ ALLOWED_ORIGINS = ""
 SUB72_FEE_CURRENCY = "USD"
 # Optional: set to 160 for the existing same-day sourcing fee. This fee is NOT charged to return GO/NO-GO.
 SUB72_LANE_B_FEE_AMOUNT = "160"
+SUB72_LANE_A_FEE_AMOUNT = "250"
 
 # Service binding to the existing Comms Worker.
 [[services]]
 binding = "noreply-wings"
 service = "noreply-wings"
+
+# --------------------------------------------------
+# SERVICE BINDING: AIRFIELDS
+# --------------------------------------------------
+
+[[services]]
+binding = "AIRFIELDS_WORKER"
+service = "airfields"
 
 [observability]
 enabled = true
