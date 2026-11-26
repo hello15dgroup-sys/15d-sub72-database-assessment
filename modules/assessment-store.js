@@ -1,3 +1,5 @@
+import { isValidSub72MissionId } from './mission-normalizer.js';
+
 const DEFAULT_SUPABASE_URL = 'https://mhplukffgcxiorpfunyy.supabase.co';
 const ASSESSMENT_TABLE = 'sub_72_hour_mission_assessments';
 const STABLECOIN_INTENT_TABLE = 'stablecoin_settlement_intents';
@@ -52,6 +54,13 @@ export async function findAssessmentByRunId(env, assessmentRunId) {
 }
 
 export async function createAssessment(env, record) {
+  if (record.mission_id && !isValidSub72MissionId(record.mission_id)) {
+    throw fail(
+      'INVALID_SUB72_MISSION_ID',
+      400,
+      'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+    );
+  }
   const { url, key } = credentials(env);
   const response = await fetch(`${url}/rest/v1/${ASSESSMENT_TABLE}`, {
     method: 'POST',
@@ -63,6 +72,13 @@ export async function createAssessment(env, record) {
 }
 
 export async function updateAssessment(env, assessmentRunId, patch) {
+  if (patch.mission_id && !isValidSub72MissionId(patch.mission_id)) {
+    throw fail(
+      'INVALID_SUB72_MISSION_ID',
+      400,
+      'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+    );
+  }
   const { url, key } = credentials(env);
   const params = new URLSearchParams({ assessment_run_id: `eq.${assessmentRunId}` });
   const response = await fetch(`${url}/rest/v1/${ASSESSMENT_TABLE}?${params}`, {
@@ -75,6 +91,14 @@ export async function updateAssessment(env, assessmentRunId, patch) {
 }
 
 export async function persistCanonicalMission(env, mission, committedAt) {
+  if (!isValidSub72MissionId(mission.missionId)) {
+    throw fail(
+      'INVALID_SUB72_MISSION_ID',
+      400,
+      'Sub-72 canonical mission IDs must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+    );
+  }
+
   const { url, key } = credentials(env);
   const params = new URLSearchParams({
     id: `eq.${mission.missionId}`,
@@ -122,6 +146,7 @@ export async function persistCanonicalMission(env, mission, committedAt) {
     p_raw_payload: {
       ...mission.originalPayload,
       sub72_assessment: {
+        mission_id_scheme: '15D-SUB72-[4-5-ALNUM]',
         committed_at: committedAt.toISOString(),
         assessment_run_id: mission.assessmentRunId,
         entrypoint: 'SUB_72_HOUR_MISSION_ASSESSMENT',
@@ -145,6 +170,13 @@ export async function persistCanonicalMission(env, mission, committedAt) {
 }
 
 export async function createStablecoinIntent(env, intent) {
+  if (intent.mission_id && !isValidSub72MissionId(intent.mission_id)) {
+    throw fail(
+      'INVALID_SUB72_MISSION_ID',
+      400,
+      'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+    );
+  }
   const { url, key } = credentials(env);
   const response = await fetch(`${url}/rest/v1/${STABLECOIN_INTENT_TABLE}`, {
     method: 'POST',
