@@ -31,6 +31,11 @@ const SOURCE_SELECT = [
 const ACCEPTED_RUNWAY_MATCHES = new Set(['MATCHED_SOURCE_ID', 'MATCHED_COORDINATES']);
 const ACCEPTED_AIRPORT_TYPES = new Set(['large_airport', 'medium_airport', 'small_airport']);
 
+export const PERMIT_POLICY_NOTICE =
+  'International or cross-border flight permits follow standard aviation lead times (typically 72+ hours). ' +
+  'Obtaining permits—whether through standard channels or any arrangement the client/operator organizes—is ' +
+  'strictly the responsibility of the client and the operator, not 15D Wings.';
+
 export async function assessFromDatabase(env, mission) {
   const db = createDatabaseClient(env);
   const codes = [...new Set(mission.legs.flatMap(leg => [leg.from, leg.to]))];
@@ -97,9 +102,15 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
 
   const blockers = [];
   const reasonCodes = [];
+  const advisories = [];
+
   const addBlocker = (code, message, context = {}) => {
     reasonCodes.push(code);
     blockers.push({ code, message, ...context });
+  };
+
+  const addAdvisory = (code, message, context = {}) => {
+    advisories.push({ code, message, ...context });
   };
 
   const regionByCode = new Map(regionRows.map(row => [String(row.code || '').toUpperCase(), row]));
@@ -146,7 +157,6 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
     });
   }
 
-  // Multi-leg route continuity is checked against the resolved airport identifiers.
   for (let i = 1; i < mission.legs.length; i += 1) {
     const previous = resolveAirport(mission.legs[i - 1].to, airportRows);
     const current = resolveAirport(mission.legs[i].from, airportRows);
@@ -162,14 +172,18 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
   const routeClassification = hasUnresolvedAirport || hasMissingCountry || countries.length === 0
     ? 'UNKNOWN'
     : countries.length === 1 ? 'DOMESTIC' : 'INTERNATIONAL_OR_MIXED';
+
   if (hasMissingCountry || countries.length === 0) {
     addBlocker('AIRPORT_COUNTRY_DATA_MISSING', 'One or more resolved airports do not have a country code in the database.');
   }
 
-  // Preserve the approved Sub-72 corridor doctrine: international/mixed routes are locked at 72h by default.
-  // There is currently no approved-corridor table in this project, so no exception is inferred.
-  if (routeClassification === 'INTERNATIONAL_OR_MIXED') {
-    addBlocker('SUB72_INTERNATIONAL_CORRIDOR_LOCK', 'International and mixed-jurisdiction routes remain locked at 72 hours by the current Sub-72 doctrine; no approved-corridor record exists in the database.');
+  if (routeClassification === 'INTERNATIONAL_OR_MIXED' || routeClassification === 'UNKNOWN') {
+    addAdvisory('PERMIT_LEAD_TIME_AND_RESPONSIBILITY', PERMIT_POLICY_NOTICE, {
+      route_classification: routeClassification,
+      sovereign_countries: countries,
+      standard_permit_window_hours: 72,
+      permit_owner: 'CLIENT_AND_OPERATOR',
+    });
   }
 
   const aircraftEvaluation = evaluateAircraft({ mission, aircraftRows, fleetRows, routeLegs, addBlocker });
@@ -181,6 +195,7 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
   const evidence = {
     decision_engine: 'DATABASE_ONLY',
     retrieved_at: retrievedAt,
+    permit_policy_notice: PERMIT_POLICY_NOTICE,
     source_tables: [
       'airports', 'runways', 'navaids', 'region', 'aircrafts', 'fleet_aircraft', 'aviation_data_sources',
     ],
@@ -227,6 +242,7 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
       type: navaid.type,
     })),
     limitations: [
+      PERMIT_POLICY_NOTICE,
       'The database contains reference data, not live NOTAM, weather, slot, curfew, or operator-confirmed availability feeds.',
       'Runway length and width are not an aircraft-specific take-off or landing performance calculation.',
       'Aircraft catalogue range is a published reference value and does not account for payload, reserves, weather, routing, alternates, or operational restrictions.',
@@ -239,6 +255,8 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
     route_classification: routeClassification,
     sovereign_countries: countries,
     airport_resolution_complete: routeLegs.length === mission.legs.length && routeLegs.every(leg => leg.resolved === true),
+    permit_assessment_performed: false,
+    permit_responsibility: 'CLIENT_AND_OPERATOR',
     legs: routeLegs,
   };
 
@@ -246,6 +264,7 @@ export function evaluateDatabaseSnapshot({ mission, snapshot, retrievedAt = new 
     decision,
     reason_codes: uniqueReasonCodes,
     blockers,
+    advisories,
     route_snapshot: routeSnapshot,
     aircraft_evaluation: aircraftEvaluation,
     evidence,
@@ -277,8 +296,8 @@ function validateAirport(airport, role, legNumber, runways, regionByCode, addBlo
 }
 
 function evaluateAircraft({ mission, aircraftRows, fleetRows, routeLegs, addBlocker }) {
-  const requestedModel = mission.aircraft.model || mission.aircraft.aircraft_model || null;
-  const requestedClass = mission.aircraft.class;
+  const requestedModel = mission.aircraft?.model || mission.aircraft?.aircraft_model || null;
+  const requestedClass = mission.aircraft?.class || 'UNSPECIFIED';
   let classRows;
 
   if (requestedModel) {
@@ -286,7 +305,6 @@ function evaluateAircraft({ mission, aircraftRows, fleetRows, routeLegs, addBloc
     classRows = aircraftRows.filter(row => normalizeToken(row.Model || row.model) === needle);
   } else {
     classRows = aircraftRows.filter(row => matchesAircraftClass(requestedClass, row.Type || row.type, row.Category || row.category));
-    // Some frontend builds submit a model name as the aircraft string rather than as aircraft.model.
     if (classRows.length === 0) {
       const needle = normalizeToken(requestedClass);
       classRows = aircraftRows.filter(row => normalizeToken(row.Model || row.model) === needle);
