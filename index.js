@@ -8,6 +8,7 @@ import {
   updateAssessment,
   persistCanonicalMission,
   createStablecoinIntent,
+  checkAndRecordManualPaymentConfirmation,
 } from './modules/assessment-store.js';
 import { dispatchAssessment } from './modules/comms-dispatch.js';
 import { buildPublicResponse } from './modules/response-builder.js';
@@ -43,14 +44,19 @@ export default {
       return json({ ok: false, error: 'NOT_FOUND' }, 404, cors);
     }
 
-    // Route 1: Stage-1 Suitability Check (Route + ETD + Aircraft/Pax -> Gated GO / NO_GO, zero missions table pollution)
+    // Route 1: Stage-1 Suitability Check
     if (['/', '/assess', '/v1/sub-72-hour-mission-assessment'].includes(url.pathname)) {
       return handlePreflightAssessment(request, env, cors);
     }
 
-    // Route 2: Stage-2 Client Intake & $160 Fee / Stablecoin Rail Commitment (Unlocks dossier & registers mission in PENDING_FEE)
+    // Route 2: Stage-2 Client Intake & $160 Fee / Stablecoin Rail Commitment
     if (['/commit', '/v1/sub-72-hour-mission-commit'].includes(url.pathname)) {
       return handleIntakeCommitment(request, env, ctx, cors);
+    }
+
+    // Route 3: Manual Payment Confirmation Check
+    if (['/confirm-payment', '/v1/sub-72-hour-mission-confirm-payment'].includes(url.pathname)) {
+      return handleConfirmPayment(request, env, cors);
     }
 
     return json({ ok: false, error: 'NOT_FOUND' }, 404, cors);
@@ -117,7 +123,6 @@ async function handlePreflightAssessment(request, env, cors) {
       evaluated_at: new Date().toISOString(),
     };
 
-    // Stage 1 returns gated summary (anti-fishing): full aerodrome/runway dossier stays locked until /commit.
     const publicResponse = buildPublicResponse({
       mission: preflight,
       urgency,
@@ -189,10 +194,8 @@ async function handleIntakeCommitment(request, env, ctx, cors) {
       }, 422, cors);
     }
 
-    // Re-check urgency at commit time to ensure departure is still in the future and < 72h.
     const urgency = calculateUrgency(assessment.departure_at, committedAt);
 
-    // Persist canonical mission in PRE_PAYMENT / PENDING_FEE state (never overwriting existing non-Sub72 missions).
     await persistCanonicalMission(env, {
       ...intake,
       departureAt: new Date(assessment.departure_at),
@@ -227,6 +230,13 @@ async function handleIntakeCommitment(request, env, ctx, cors) {
     const unlockedResponse = buildPublicResponse({
       mission: {
         missionId: intake.missionId,
+        client: intake.client,
+        aircraft: intake.aircraft,
+        passengerCount: intake.passengerCount,
+        manifest: intake.manifest,
+        legs: assessment.airfield_payload?.legs || intake.legs,
+        estimateLower: intake.estimateLower,
+        estimateUpper: intake.estimateUpper,
         departureAt: new Date(assessment.departure_at),
       },
       urgency,
@@ -307,6 +317,63 @@ async function handleIntakeCommitment(request, env, ctx, cors) {
   }
 }
 
+async function handleConfirmPayment(request, env, cors) {
+  const payload = await readJsonBody(request, cors);
+  if (payload instanceof Response) return payload;
+
+  const rawMissionId = payload?.mission_id ?? payload?.request_id ?? payload?.ref_id ?? '';
+  const missionId = String(rawMissionId).trim().toUpperCase();
+  const assessmentRunId = payload?.assessment_run_id ? String(payload.assessment_run_id).trim() : null;
+  const settlementReference = payload?.settlement_reference ?? payload?.reference ?? null;
+  const txHash = payload?.tx_hash ?? null;
+  const rail = payload?.settlement_rail ?? payload?.rail ?? 'WIRE_OR_MANUAL';
+
+  if (!missionId) {
+    return json({
+      ok: false,
+      error: 'MISSING_MISSION_ID',
+      message: 'mission_id (15D-SUB72-XXXX or 15D-SUB72-XXXXX) is required to confirm payment.',
+    }, 400, cors);
+  }
+
+  try {
+    const result = await checkAndRecordManualPaymentConfirmation(env, {
+      missionId,
+      assessmentRunId,
+      settlementReference: settlementReference ? String(settlementReference).trim() : null,
+      txHash: txHash ? String(txHash).trim() : null,
+      rail: String(rail).trim().toUpperCase(),
+    });
+
+    const feeAmount = Number(env.SUB72_FEE_AMOUNT || 160);
+    const feeCurrency = String(env.SUB72_FEE_CURRENCY || 'USD').toUpperCase();
+
+    return json({
+      ok: true,
+      service: 'SUB_72_HOUR_DATABASE_ASSESSMENT',
+      mission_id: result.mission_id,
+      assessment_run_id: assessmentRunId,
+      payment_verified: result.verified,
+      verification_state: result.state,
+      fee_amount: feeAmount,
+      fee_currency: feeCurrency,
+      refundable: false,
+      database_check: result,
+      message: result.verified
+        ? `Confirmed in database: the $${feeAmount} ${feeCurrency} Sub-72H fee for ${result.mission_id} is verified.`
+        : `Payment confirmation logged for ${result.mission_id}, but the $${feeAmount} ${feeCurrency} fee is not yet marked verified in the database. Strategic Authority verification is still required.`,
+    }, 200, cors);
+  } catch (error) {
+    console.error('SUB72_CONFIRM_PAYMENT_ERROR', error?.stack || error?.message || error);
+    return json({
+      ok: false,
+      error: error.code || 'CONFIRM_PAYMENT_FAILED',
+      message: safeErrorMessage(error),
+      mission_id: missionId || null,
+    }, error.statusCode || 500, cors);
+  }
+}
+
 async function readJsonBody(request, cors) {
   let rawText;
   try {
@@ -364,6 +431,7 @@ function json(value, status, cors) {
 function safeErrorMessage(error) {
   const known = {
     INVALID_MISSION_PAYLOAD: 'The submitted mission details are incomplete or invalid.',
+    INVALID_SUB72_MISSION_ID: 'Sub-72 mission IDs must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
     NOT_A_SUB72_MISSION: 'This departure is outside the Sub-72-hour assessment window.',
     FEE_ACKNOWLEDGEMENT_REQUIRED: 'You must acknowledge the flat non-refundable $160 Sub-72-hour sourcing fee before proceeding.',
     MISSION_ID_ALREADY_REGISTERED: 'This mission reference is already registered and was not overwritten.',
