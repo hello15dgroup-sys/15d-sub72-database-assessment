@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateDatabaseSnapshot } from '../modules/database-assessment.js';
+import { generateSub72MissionId, isValidSub72MissionId } from '../modules/mission-normalizer.js';
+import { calculateUrgency } from '../modules/urgency-engine.js';
 
 const mission = (aircraftClass = 'HEAVY', pax = 4) => ({
-  missionId: '15D-TEST1',
+  missionId: '15D-SUB72-A7K9P',
   passengerCount: pax,
   aircraft: { class: aircraftClass },
   legs: [{ from: 'DNAA', to: 'DNMM', techStops: 0 }],
@@ -37,7 +39,7 @@ test('GO when domestic airports, matched open runways, regions and aircraft capa
   assert.equal(result.aircraft_evaluation.eligible_models[0].model, 'Heavy 5000');
 });
 
-test('NO_GO when route is international under the existing 72-hour corridor lock', () => {
+test('International route is not blocked as NO_GO for permits and emits a client/operator permit advisory', () => {
   const snapshot = baseSnapshot();
   snapshot.airports[1] = {
     ...snapshot.airports[1],
@@ -47,8 +49,9 @@ test('NO_GO when route is international under the existing 72-hour corridor lock
   };
   snapshot.regions.push({ id: 103, code: 'GH-AA', name: 'Greater Accra', iso_country: 'GH' });
   const result = evaluateDatabaseSnapshot({ mission: mission(), snapshot });
-  assert.equal(result.decision, 'NO_GO');
-  assert.ok(result.reason_codes.includes('SUB72_INTERNATIONAL_CORRIDOR_LOCK'));
+  assert.equal(result.decision, 'GO');
+  assert.ok(!result.reason_codes.includes('SUB72_INTERNATIONAL_CORRIDOR_LOCK'));
+  assert.ok(result.advisories.some(a => a.code === 'PERMIT_LEAD_TIME_AND_RESPONSIBILITY'));
 });
 
 test('NO_GO when no positively matched open runway exists', () => {
@@ -77,4 +80,20 @@ test('Navaid absence is informational and does not by itself block a database GO
   const result = evaluateDatabaseSnapshot({ mission: mission(), snapshot: baseSnapshot() });
   assert.equal(result.decision, 'GO');
   assert.equal(result.evidence.record_counts.navaids_returned, 0);
+});
+
+test('Sub-72 mission ID generator produces 15D-SUB72-XXXX or 15D-SUB72-XXXXX', () => {
+  const id4 = generateSub72MissionId(4);
+  const id5 = generateSub72MissionId(5);
+  assert.equal(isValidSub72MissionId(id4), true);
+  assert.equal(isValidSub72MissionId(id5), true);
+  assert.equal(isValidSub72MissionId('15D-ABCDE'), false);
+});
+
+test('Urgency engine treats all <72H departures as SUB72_FLAT', () => {
+  const now = new Date('2026-11-26T12:00:00.000Z');
+  const in10h = new Date('2026-11-26T22:00:00.000Z');
+  const in40h = new Date('2026-11-28T04:00:00.000Z');
+  assert.equal(calculateUrgency(in10h, now).band, 'SUB72_FLAT');
+  assert.equal(calculateUrgency(in40h, now).band, 'SUB72_FLAT');
 });
