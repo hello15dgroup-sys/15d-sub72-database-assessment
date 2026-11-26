@@ -15,7 +15,9 @@ export function calculateUrgency(departureAt, submittedAt = new Date()) {
 
   return {
     hoursToDeparture: Number(hoursToDeparture.toFixed(4)),
-    band: hoursToDeparture < 24 ? 'LANE_B' : 'LANE_A',
+    band: 'SUB72_FLAT',
+    feeApplicable: true,
+    departureAt: new Date(departureMs).toISOString(),
     calculatedAt: new Date(submittedMs).toISOString(),
   };
 }
