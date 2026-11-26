@@ -189,6 +189,97 @@ export async function createStablecoinIntent(env, intent) {
   return Array.isArray(rows) ? rows[0] || null : null;
 }
 
+export async function checkAndRecordManualPaymentConfirmation(env, {
+  missionId,
+  assessmentRunId = null,
+  settlementReference = null,
+  txHash = null,
+  rail = 'WIRE_OR_MANUAL',
+}) {
+  if (!isValidSub72MissionId(missionId)) {
+    throw fail(
+      'INVALID_SUB72_MISSION_ID',
+      400,
+      'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+    );
+  }
+
+  const { url, key } = credentials(env);
+  const params = new URLSearchParams({
+    id: `eq.${missionId}`,
+    select: 'id,status,payment_status,payment_verified,payment_verified_at,raw_payload',
+    limit: '1',
+  });
+
+  const missionRes = await fetch(`${url}/rest/v1/missions?${params}`, {
+    headers: headers(key),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!missionRes.ok) throw await dbError(missionRes, 'MISSION_LOOKUP_FAILED');
+  const rows = await missionRes.json();
+  const missionRow = Array.isArray(rows) ? rows[0] || null : null;
+
+  if (!missionRow) {
+    return {
+      found: false,
+      verified: false,
+      state: 'MISSION_NOT_FOUND',
+      mission_id: missionId,
+    };
+  }
+
+  const rawMeta = missionRow.raw_payload?.sub72_assessment || {};
+  const verified = Boolean(
+    missionRow.payment_verified === true ||
+    ['VERIFIED', 'PAID', 'SETTLED'].includes(String(missionRow.payment_status || '').toUpperCase()) ||
+    rawMeta.fee_verified === true,
+  );
+
+  const confirmedAt = new Date().toISOString();
+  const updatedRawPayload = {
+    ...(missionRow.raw_payload || {}),
+    sub72_assessment: {
+      ...rawMeta,
+      manual_payment_claim_submitted_at: confirmedAt,
+      manual_payment_rail: rail,
+      manual_settlement_reference: settlementReference || rawMeta.manual_settlement_reference || null,
+      manual_tx_hash: txHash || rawMeta.manual_tx_hash || null,
+      fee_verified: verified,
+    },
+  };
+
+  await fetch(`${url}/rest/v1/missions?${new URLSearchParams({ id: `eq.${missionId}` })}`, {
+    method: 'PATCH',
+    headers: headers(key, { Prefer: 'return=minimal' }),
+    body: JSON.stringify({
+      raw_payload: updatedRawPayload,
+      payment_status: verified
+        ? (missionRow.payment_status || 'VERIFIED')
+        : (missionRow.payment_status || 'PENDING_VERIFICATION'),
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (assessmentRunId) {
+    await updateAssessment(env, assessmentRunId, {
+      assessment_status: verified ? 'FEE_VERIFIED' : 'PAYMENT_CONFIRMATION_SUBMITTED',
+    }).catch(() => {});
+  }
+
+  return {
+    found: true,
+    verified,
+    state: verified ? 'PAYMENT_VERIFIED' : 'AWAITING_AUTHORITY_VERIFICATION',
+    mission_id: missionId,
+    mission_status: missionRow.status || null,
+    payment_status: verified ? 'VERIFIED' : 'PENDING_VERIFICATION',
+    payment_verified_at: missionRow.payment_verified_at || null,
+    settlement_reference: settlementReference || null,
+    tx_hash: txHash || null,
+    checked_at: confirmedAt,
+  };
+}
+
 async function dbError(response, fallbackCode) {
   const body = await response.text().catch(() => '');
   return fail(fallbackCode, 502, `${fallbackCode}: HTTP ${response.status} ${body.slice(0, 800)}`);
