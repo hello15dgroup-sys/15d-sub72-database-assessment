@@ -3,6 +3,7 @@ import { isValidSub72MissionId } from './mission-normalizer.js';
 const DEFAULT_SUPABASE_URL = 'https://mhplukffgcxiorpfunyy.supabase.co';
 const ASSESSMENT_TABLE = 'sub_72_hour_mission_assessments';
 const STABLECOIN_INTENT_TABLE = 'stablecoin_settlement_intents';
+const PREFLIGHT_PLACEHOLDER_EMAIL = 'pending-intake@15dwings.com.ng';
 
 const ALLOWED_ASSESSMENT_STATUSES = new Set([
   'RECEIVED',
@@ -141,14 +142,23 @@ export async function persistCanonicalMission(env, mission, committedAt) {
   if (Array.isArray(existingRows) && existingRows.length) {
     const existing = existingRows[0];
     const entrypoint = existing.raw_payload?.sub72_assessment?.entrypoint;
-    const sameClient = !mission.client?.email ||
-      String(existing.client_email || '').toLowerCase() === mission.client.email;
-    if (entrypoint === 'SUB_72_HOUR_MISSION_ASSESSMENT' && sameClient) return;
-    throw fail(
-      'MISSION_ID_ALREADY_REGISTERED',
-      409,
-      'This mission identifier is already registered and cannot be overwritten by the Sub-72 entry point.',
-    );
+    const existingEmail = String(existing.client_email || '').toLowerCase();
+    const isPreflightPlaceholder = existingEmail === PREFLIGHT_PLACEHOLDER_EMAIL;
+    const sameClient =
+      isPreflightPlaceholder ||
+      !mission.client?.email ||
+      existingEmail === mission.client.email;
+
+    if (entrypoint === 'SUB_72_HOUR_MISSION_ASSESSMENT' && sameClient) {
+      if (!isPreflightPlaceholder) return;
+      // Upgrade the Stage-1 preflight placeholder row into the committed client mission.
+    } else {
+      throw fail(
+        'MISSION_ID_ALREADY_REGISTERED',
+        409,
+        'This mission identifier is already registered and cannot be overwritten by the Sub-72 entry point.',
+      );
+    }
   }
 
   const manifest = mission.manifest || {};
@@ -156,7 +166,7 @@ export async function persistCanonicalMission(env, mission, committedAt) {
   const args = {
     p_id: mission.missionId,
     p_client_name: mission.client?.name || 'Pending Intake',
-    p_client_email: mission.client?.email || 'pending-intake@15dwings.com.ng',
+    p_client_email: mission.client?.email || PREFLIGHT_PLACEHOLDER_EMAIL,
     p_client_phone: mission.client?.phone || null,
     p_booking_mode: 'SELF',
     p_status: isCommitted ? 'PENDING_FEE' : 'PREFLIGHT_ASSESSMENT',
