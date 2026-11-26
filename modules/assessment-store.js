@@ -4,6 +4,15 @@ const DEFAULT_SUPABASE_URL = 'https://mhplukffgcxiorpfunyy.supabase.co';
 const ASSESSMENT_TABLE = 'sub_72_hour_mission_assessments';
 const STABLECOIN_INTENT_TABLE = 'stablecoin_settlement_intents';
 
+const ALLOWED_ASSESSMENT_STATUSES = new Set([
+  'RECEIVED',
+  'RESEARCHING',
+  'ASSESSING',
+  'COMPLETED',
+  'FAILED',
+  'HUMAN_REVIEW_REQUIRED',
+]);
+
 function credentials(env) {
   const url = (env.SUPABASE_URL || DEFAULT_SUPABASE_URL).replace(/\/$/, '');
   const key = env.SUPABASE_SERVICE_ROLE_KEY;
@@ -19,6 +28,15 @@ function headers(key, extra = {}) {
     Accept: 'application/json',
     ...extra,
   };
+}
+
+function sanitizeAssessmentStatus(status) {
+  const normalized = String(status || '').trim().toUpperCase();
+  if (ALLOWED_ASSESSMENT_STATUSES.has(normalized)) return normalized;
+  if (normalized.startsWith('COMMITTED') || normalized.startsWith('FEE_') || normalized.startsWith('PAYMENT_')) {
+    return 'COMPLETED';
+  }
+  return 'ASSESSING';
 }
 
 export async function findAssessmentByIdempotency(env, idempotencyKey) {
@@ -54,18 +72,22 @@ export async function findAssessmentByRunId(env, assessmentRunId) {
 }
 
 export async function createAssessment(env, record) {
-  if (record.mission_id && !isValidSub72MissionId(record.mission_id)) {
+  if (!record.mission_id || !isValidSub72MissionId(record.mission_id)) {
     throw fail(
       'INVALID_SUB72_MISSION_ID',
       400,
-      'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
+      'mission_id is required and must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
     );
   }
+  const safeRecord = {
+    ...record,
+    assessment_status: sanitizeAssessmentStatus(record.assessment_status),
+  };
   const { url, key } = credentials(env);
   const response = await fetch(`${url}/rest/v1/${ASSESSMENT_TABLE}`, {
     method: 'POST',
     headers: headers(key, { Prefer: 'return=representation' }),
-    body: JSON.stringify(record),
+    body: JSON.stringify(safeRecord),
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw await dbError(response, 'ASSESSMENT_CREATE_FAILED');
@@ -79,12 +101,16 @@ export async function updateAssessment(env, assessmentRunId, patch) {
       'mission_id must match 15D-SUB72-XXXX or 15D-SUB72-XXXXX.',
     );
   }
+  const safePatch = { ...patch, updated_at: new Date().toISOString() };
+  if (safePatch.assessment_status) {
+    safePatch.assessment_status = sanitizeAssessmentStatus(safePatch.assessment_status);
+  }
   const { url, key } = credentials(env);
   const params = new URLSearchParams({ assessment_run_id: `eq.${assessmentRunId}` });
   const response = await fetch(`${url}/rest/v1/${ASSESSMENT_TABLE}?${params}`, {
     method: 'PATCH',
     headers: headers(key, { Prefer: 'return=minimal' }),
-    body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+    body: JSON.stringify(safePatch),
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) throw await dbError(response, 'ASSESSMENT_UPDATE_FAILED');
@@ -115,7 +141,8 @@ export async function persistCanonicalMission(env, mission, committedAt) {
   if (Array.isArray(existingRows) && existingRows.length) {
     const existing = existingRows[0];
     const entrypoint = existing.raw_payload?.sub72_assessment?.entrypoint;
-    const sameClient = String(existing.client_email || '').toLowerCase() === mission.client.email;
+    const sameClient = !mission.client?.email ||
+      String(existing.client_email || '').toLowerCase() === mission.client.email;
     if (entrypoint === 'SUB_72_HOUR_MISSION_ASSESSMENT' && sameClient) return;
     throw fail(
       'MISSION_ID_ALREADY_REGISTERED',
@@ -125,13 +152,14 @@ export async function persistCanonicalMission(env, mission, committedAt) {
   }
 
   const manifest = mission.manifest || {};
+  const isCommitted = Boolean(mission.client?.name && mission.client?.email);
   const args = {
     p_id: mission.missionId,
-    p_client_name: mission.client.name,
-    p_client_email: mission.client.email,
-    p_client_phone: mission.client.phone,
+    p_client_name: mission.client?.name || 'Pending Intake',
+    p_client_email: mission.client?.email || 'pending-intake@15dwings.com.ng',
+    p_client_phone: mission.client?.phone || null,
     p_booking_mode: 'SELF',
-    p_status: 'PENDING_FEE',
+    p_status: isCommitted ? 'PENDING_FEE' : 'PREFLIGHT_ASSESSMENT',
     p_pax: mission.passengerCount,
     p_adults: safeInt(manifest.adults, mission.passengerCount),
     p_children: safeInt(manifest.children, 0),
@@ -148,12 +176,12 @@ export async function persistCanonicalMission(env, mission, committedAt) {
       sub72_assessment: {
         mission_id_scheme: '15D-SUB72-[4-5-ALNUM]',
         committed_at: committedAt.toISOString(),
-        assessment_run_id: mission.assessmentRunId,
+        assessment_run_id: mission.assessmentRunId || null,
         entrypoint: 'SUB_72_HOUR_MISSION_ASSESSMENT',
         decision_engine: 'DATABASE_ONLY',
         payment_phase: 'PRE_PAYMENT',
-        sourcing_state: 'PENDING_FEE',
-        settlement_rail: mission.settlementRail,
+        sourcing_state: isCommitted ? 'PENDING_FEE' : 'PREFLIGHT_ONLY',
+        settlement_rail: mission.settlementRail || null,
         non_refundable_fee_acknowledged: Boolean(mission.feeAcknowledged),
         permit_responsibility_acknowledged: Boolean(mission.permitResponsibilityAcknowledged),
       },
@@ -262,7 +290,7 @@ export async function checkAndRecordManualPaymentConfirmation(env, {
 
   if (assessmentRunId) {
     await updateAssessment(env, assessmentRunId, {
-      assessment_status: verified ? 'FEE_VERIFIED' : 'PAYMENT_CONFIRMATION_SUBMITTED',
+      assessment_status: verified ? 'COMPLETED' : 'HUMAN_REVIEW_REQUIRED',
     }).catch(() => {});
   }
 
