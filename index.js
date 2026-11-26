@@ -1,4 +1,8 @@
-import { normalizePreflightPayload, normalizeIntakePayload } from './modules/mission-normalizer.js';
+import {
+  normalizePreflightPayload,
+  normalizeIntakePayload,
+  generateSub72MissionId,
+} from './modules/mission-normalizer.js';
 import { calculateUrgency } from './modules/urgency-engine.js';
 import { assessFromDatabase } from './modules/database-assessment.js';
 import {
@@ -75,25 +79,31 @@ async function handlePreflightAssessment(request, env, cors) {
   try {
     preflight = normalizePreflightPayload(payload);
     const urgency = calculateUrgency(preflight.departureAt, submittedAt);
+    const dbUrgencyBand = resolveDbUrgencyBand(urgency.hoursToDeparture);
     assessmentRunId = createAssessmentRunId();
+    const missionId = preflight.missionId || generateSub72MissionId(5);
+    const preflightMission = { ...preflight, missionId };
 
     const idempotencyKey = preflight.idempotencyKey
-      ? `${preflight.idempotencyKey}:SUB72:${IDEMPOTENCY_VERSION}`
-      : null;
+      ? `${preflight.idempotencyKey}:SUB72:${IDEMPOTENCY_VERSION}`.slice(0, 160)
+      : `${missionId}:${assessmentRunId}:${IDEMPOTENCY_VERSION}`.slice(0, 160);
 
-    if (idempotencyKey) {
+    if (preflight.idempotencyKey) {
       const existing = await findAssessmentByIdempotency(env, idempotencyKey);
       if (existing?.frontend_response && Object.keys(existing.frontend_response).length) {
         return json(existing.frontend_response, 200, cors);
       }
     }
 
+    // Ensure parent missions(id) row exists before inserting into sub_72_hour_mission_assessments.
+    await persistCanonicalMission(env, preflightMission, submittedAt);
+
     await createAssessment(env, {
       assessment_run_id: assessmentRunId,
-      mission_id: preflight.missionId || null,
+      mission_id: missionId,
       idempotency_key: idempotencyKey,
       assessment_status: 'RECEIVED',
-      urgency_band: urgency.band,
+      urgency_band: dbUrgencyBand,
       hours_to_departure: urgency.hoursToDeparture,
       departure_at: preflight.departureAt.toISOString(),
       submitted_at: submittedAt.toISOString(),
@@ -109,7 +119,7 @@ async function handlePreflightAssessment(request, env, cors) {
     });
     assessmentCreated = true;
 
-    const databaseAssessment = await assessFromDatabase(env, preflight);
+    const databaseAssessment = await assessFromDatabase(env, preflightMission);
 
     const decision = {
       decision: databaseAssessment.decision,
@@ -124,7 +134,7 @@ async function handlePreflightAssessment(request, env, cors) {
     };
 
     const publicResponse = buildPublicResponse({
-      mission: preflight,
+      mission: preflightMission,
       urgency,
       assessmentRunId,
       databaseAssessment,
@@ -262,7 +272,7 @@ async function handleIntakeCommitment(request, env, ctx, cors) {
 
     await updateAssessment(env, intake.assessmentRunId, {
       mission_id: intake.missionId,
-      assessment_status: 'COMMITTED_PENDING_FEE',
+      assessment_status: 'COMPLETED',
       frontend_response: unlockedResponse,
     });
 
@@ -372,6 +382,10 @@ async function handleConfirmPayment(request, env, cors) {
       mission_id: missionId || null,
     }, error.statusCode || 500, cors);
   }
+}
+
+function resolveDbUrgencyBand(hoursToDeparture) {
+  return Number(hoursToDeparture) < 24 ? 'LANE_B' : 'LANE_A';
 }
 
 async function readJsonBody(request, cors) {
